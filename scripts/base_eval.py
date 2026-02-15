@@ -34,58 +34,45 @@ from contextlib import nullcontext
 import torch
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
-from nanochat.tokenizer import HuggingFaceTokenizer, get_token_bytes
+from nanochat.tokenizer import TransformersTokenizer, get_token_bytes
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
+from nanochat.model_adapter import HFBackedCausalLMAdapter, Qwen3HFAdapter
 
 # -----------------------------------------------------------------------------
 # HuggingFace loading utilities
 
-class ModelWrapper:
-    """Lightweight wrapper to give HuggingFace models a nanochat-compatible interface."""
-    def __init__(self, model, max_seq_len=None):
-        self.model = model
-        self.max_seq_len = max_seq_len
-
-    def __call__(self, input_ids, targets=None, loss_reduction='mean'):
-        logits = self.model(input_ids).logits
-        if targets is None:
-            return logits
-        loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            targets.view(-1),
-            ignore_index=-1,
-            reduction=loss_reduction
-        )
-        return loss
-
-    def get_device(self):
-        return next(self.model.parameters()).device
-
-
 def load_hf_model(hf_path: str, device):
     """Load a HuggingFace model and tokenizer."""
     print0(f"Loading HuggingFace model from: {hf_path}")
-    from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(hf_path)
+    if "qwen3" in hf_path.lower():
+        model = Qwen3HFAdapter.from_pretrained(hf_path)
+    else:
+        model = HFBackedCausalLMAdapter.from_pretrained(hf_path)
     model.to(device)
     model.eval()
-    max_seq_len = 1024 if "gpt2" in hf_path else None
-    model = ModelWrapper(model, max_seq_len=max_seq_len)
-    tokenizer = HuggingFaceTokenizer.from_pretrained(hf_path)
+    tokenizer = TransformersTokenizer.from_pretrained(hf_path)
     return model, tokenizer
 
 
 def get_hf_token_bytes(tokenizer, device="cpu"):
     """Compute token_bytes tensor for a HuggingFace tokenizer."""
-    vocab_size = tokenizer.tokenizer.get_vocab_size()
+    vocab_size = tokenizer.get_vocab_size()
     token_bytes = torch.zeros(vocab_size, dtype=torch.int64, device=device)
+    special_ids = {
+        tokenizer.encode_special(token_str)
+        for token_str in tokenizer.get_special_tokens()
+    }
+    special_ids.discard(None)
     for token_id in range(vocab_size):
-        token_str = tokenizer.tokenizer.decode([token_id])
-        token_bytes[token_id] = len(token_str.encode('utf-8'))
+        if token_id in special_ids:
+            token_bytes[token_id] = 0
+        else:
+            token_str = tokenizer.decode([token_id])
+            token_bytes[token_id] = len(token_str.encode('utf-8'))
     return token_bytes
 
 # -----------------------------------------------------------------------------
@@ -205,14 +192,17 @@ def main():
     is_hf_model = args.hf_path is not None
     if is_hf_model:
         model, tokenizer = load_hf_model(args.hf_path, device)
-        sequence_len = model.max_seq_len or 1024
+        sequence_len = min(model.max_seq_len or 1024, 2048)
         token_bytes = get_hf_token_bytes(tokenizer, device=device)
         model_name = args.hf_path
         model_slug = args.hf_path.replace("/", "-")
     else:
         model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
-        sequence_len = meta["model_config"]["sequence_len"]
-        token_bytes = get_token_bytes(device=device)
+        sequence_len = meta.get("model_config", {}).get("sequence_len", getattr(model, "max_seq_len", 1024))
+        if isinstance(tokenizer, TransformersTokenizer):
+            token_bytes = get_hf_token_bytes(tokenizer, device=device)
+        else:
+            token_bytes = get_token_bytes(device=device)
         model_name = f"base_model (step {meta['step']})"
         model_slug = f"base_model_{meta['step']:06d}"
 
@@ -226,11 +216,12 @@ def main():
     unconditioned_samples = []
 
     # --- Sampling ---
-    if 'sample' in eval_modes and not is_hf_model:
+    if 'sample' in eval_modes:
         print0("\n" + "="*80)
         print0("Model Samples")
         print0("="*80)
         if ddp_rank == 0:
+            bos_token_id = tokenizer.get_bos_token_id()
             prompts = [
                 "The capital of France is",
                 "The chemical symbol of gold is",
@@ -243,7 +234,7 @@ def main():
             engine = Engine(model, tokenizer)
             print0("\nConditioned samples:")
             for prompt in prompts:
-                tokens = tokenizer(prompt, prepend="<|bos|>")
+                tokens = tokenizer(prompt, prepend=bos_token_id)
                 with autocast_ctx:
                     sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
                 sample_str = tokenizer.decode(sample[0])
@@ -252,7 +243,7 @@ def main():
                 samples.append(sample_str)
 
             print0("\nUnconditioned samples:")
-            tokens = tokenizer("", prepend="<|bos|>")
+            tokens = tokenizer("", prepend=bos_token_id)
             with autocast_ctx:
                 uncond, _ = engine.generate_batch(tokens, num_samples=8, max_tokens=128, temperature=1.0)
             for sample in uncond:
@@ -260,8 +251,6 @@ def main():
                 print0("-" * 80)
                 print0(sample_str)
                 unconditioned_samples.append(sample_str)
-    elif 'sample' in eval_modes and is_hf_model:
-        print0("\nSkipping sampling for HuggingFace models (not supported)")
 
     # --- BPB evaluation ---
     if 'bpb' in eval_modes:

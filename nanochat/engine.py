@@ -151,6 +151,21 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
         return torch.multinomial(probs, num_samples=1, generator=rng)
 
 # -----------------------------------------------------------------------------
+def _encode_special_safe(tokenizer, token_name):
+    try:
+        return tokenizer.encode_special(token_name)
+    except Exception:
+        return None
+
+
+# -----------------------------------------------------------------------------
+def _normalize_device(device):
+    if isinstance(device, torch.device):
+        return device
+    return torch.device(device)
+
+
+# -----------------------------------------------------------------------------
 
 class RowState:
     # Per-row state tracking during generation
@@ -167,11 +182,21 @@ class Engine:
         self.model = model
         self.tokenizer = tokenizer # needed for tool use
 
+    def _uses_full_recompute_generation(self):
+        return getattr(self.model, "engine_mode", "kv_cache") == "full_recompute"
+
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+        if self._uses_full_recompute_generation():
+            yield from self._generate_full_recompute(tokens, num_samples, max_tokens, temperature, top_k, seed)
+            return
+        yield from self._generate_with_kv_cache(tokens, num_samples, max_tokens, temperature, top_k, seed)
+
+    @torch.inference_mode()
+    def _generate_with_kv_cache(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
         """Same as generate, but does single prefill and then clones the KV cache."""
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
-        device = self.model.get_device()
+        device = _normalize_device(self.model.get_device())
         # NOTE: setting the dtype here and in this way is an ugly hack.
         # Currently the repo assumes that cuda -> bfloat16 and everything else -> float32.
         # We need to know the dtype here to call __init__ on KVCache and pre-allocate its tensors.
@@ -183,7 +208,7 @@ class Engine:
         rng.manual_seed(seed)
 
         # Get the special tokens we need to coordinate the tool use state machine
-        get_special = lambda s: self.tokenizer.encode_special(s)
+        get_special = lambda s: _encode_special_safe(self.tokenizer, s)
         python_start = get_special("<|python_start|>")
         python_end = get_special("<|python_end|>")
         output_start = get_special("<|output_start|>")
@@ -246,18 +271,18 @@ class Engine:
                 # Update the state of this row to include the next token
                 state.current_tokens.append(next_token)
                 # On <|assistant_end|> or <|bos|>, mark the row as completed
-                if next_token == assistant_end or next_token == bos:
+                if (assistant_end is not None and next_token == assistant_end) or next_token == bos:
                     state.completed = True
                 # Handle tool logic
-                if next_token == python_start:
+                if python_start is not None and next_token == python_start:
                     state.in_python_block = True
                     state.python_expr_tokens = []
-                elif next_token == python_end and state.in_python_block:
+                elif python_end is not None and next_token == python_end and state.in_python_block:
                     state.in_python_block = False
                     if state.python_expr_tokens:
                         expr = self.tokenizer.decode(state.python_expr_tokens)
                         result = use_calculator(expr)
-                        if result is not None:
+                        if result is not None and output_start is not None and output_end is not None:
                             result_tokens = self.tokenizer.encode(str(result))
                             state.forced_tokens.append(output_start)
                             state.forced_tokens.extend(result_tokens)
@@ -274,13 +299,86 @@ class Engine:
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
             logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
 
+    @torch.inference_mode()
+    def _generate_full_recompute(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+        """
+        Generic generation path that does not rely on model-specific KV-cache internals.
+        This is slower, but works for HF-backed models in Phase A.
+        """
+        assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
+        device = _normalize_device(self.model.get_device())
+        rng = torch.Generator(device=device)
+        rng.manual_seed(seed)
+
+        get_special = lambda s: _encode_special_safe(self.tokenizer, s)
+        python_start = get_special("<|python_start|>")
+        python_end = get_special("<|python_end|>")
+        output_start = get_special("<|output_start|>")
+        output_end = get_special("<|output_end|>")
+        assistant_end = get_special("<|assistant_end|>")
+        bos = self.tokenizer.get_bos_token_id()
+
+        # Initial prefill once, then broadcast logits to rows.
+        ids = torch.tensor([tokens], dtype=torch.long, device=device)
+        logits = self.model.forward(ids)[:, -1, :].expand(num_samples, -1)
+        row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
+
+        num_generated = 0
+        while True:
+            if max_tokens is not None and num_generated >= max_tokens:
+                break
+            if all(state.completed for state in row_states):
+                break
+
+            next_ids = sample_next_token(logits, rng, temperature, top_k)
+            sampled_tokens = next_ids[:, 0].tolist()
+
+            token_column = []
+            token_masks = []
+            for i, state in enumerate(row_states):
+                is_forced = len(state.forced_tokens) > 0
+                token_masks.append(0 if is_forced else 1)
+                next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
+                token_column.append(next_token)
+
+                state.current_tokens.append(next_token)
+                if (assistant_end is not None and next_token == assistant_end) or next_token == bos:
+                    state.completed = True
+
+                if python_start is not None and next_token == python_start:
+                    state.in_python_block = True
+                    state.python_expr_tokens = []
+                elif python_end is not None and next_token == python_end and state.in_python_block:
+                    state.in_python_block = False
+                    if state.python_expr_tokens:
+                        expr = self.tokenizer.decode(state.python_expr_tokens)
+                        result = use_calculator(expr)
+                        if result is not None and output_start is not None and output_end is not None:
+                            result_tokens = self.tokenizer.encode(str(result))
+                            state.forced_tokens.append(output_start)
+                            state.forced_tokens.extend(result_tokens)
+                            state.forced_tokens.append(output_end)
+                    state.python_expr_tokens = []
+                elif state.in_python_block:
+                    state.python_expr_tokens.append(next_token)
+
+            yield token_column, token_masks
+            num_generated += 1
+
+            # Recompute logits for each row from its full token history.
+            row_logits = []
+            for state in row_states:
+                row_ids = torch.tensor([state.current_tokens], dtype=torch.long, device=device)
+                row_logits.append(self.model.forward(row_ids)[:, -1, :])
+            logits = torch.cat(row_logits, dim=0)
+
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """
         Non-streaming batch generation that just returns the final token sequences.
         Returns a list of token sequences (list of lists of ints).
         Terminal tokens (assistant_end, bos) are not included in the results.
         """
-        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
+        assistant_end = _encode_special_safe(self.tokenizer, "<|assistant_end|>")
         bos = self.tokenizer.get_bos_token_id()
         results = [tokens.copy() for _ in range(num_samples)]
         masks = [[0] * len(tokens) for _ in range(num_samples)]
@@ -288,7 +386,7 @@ class Engine:
         for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
             for i, (token, mask) in enumerate(zip(token_column, token_masks)):
                 if not completed[i]:
-                    if token == assistant_end or token == bos:
+                    if (assistant_end is not None and token == assistant_end) or token == bos:
                         completed[i] = True
                     else:
                         results[i].append(token)

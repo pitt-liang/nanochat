@@ -155,6 +155,106 @@ class HuggingFaceTokenizer:
         print(f"Saved tokenizer to {tokenizer_path}")
 
 # -----------------------------------------------------------------------------
+# Tokenizer wrapper based on transformers.AutoTokenizer
+
+class TransformersTokenizer:
+    """Light wrapper around transformers.AutoTokenizer for inference/eval."""
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.bos_token_id = self._resolve_bos_token_id()
+
+    @classmethod
+    def from_pretrained(cls, model_id, **kwargs):
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_id, **kwargs)
+        return cls(tokenizer)
+
+    def _resolve_bos_token_id(self):
+        if self.tokenizer.bos_token_id is not None:
+            return self.tokenizer.bos_token_id
+        # Fallbacks for tokenizers that don't explicitly define BOS
+        for tok in ("<|bos|>", "<|endoftext|>"):
+            tok_id = self.encode_special(tok)
+            if tok_id is not None:
+                return tok_id
+        if self.tokenizer.eos_token_id is not None:
+            return self.tokenizer.eos_token_id
+        raise ValueError("Failed to resolve BOS token id")
+
+    def get_vocab_size(self):
+        return len(self.tokenizer)
+
+    def get_special_tokens(self):
+        specials = []
+        if self.tokenizer.bos_token is not None:
+            specials.append(self.tokenizer.bos_token)
+        if self.tokenizer.eos_token is not None:
+            specials.append(self.tokenizer.eos_token)
+        if self.tokenizer.pad_token is not None:
+            specials.append(self.tokenizer.pad_token)
+        if self.tokenizer.unk_token is not None:
+            specials.append(self.tokenizer.unk_token)
+        additional = getattr(self.tokenizer, "additional_special_tokens", None) or []
+        specials.extend(additional)
+        return list(dict.fromkeys(specials))
+
+    def id_to_token(self, id):
+        return self.tokenizer.convert_ids_to_tokens(id)
+
+    def encode_special(self, text):
+        # convert_tokens_to_ids often returns unk id for unknown tokens, so verify vocab membership.
+        vocab = self.tokenizer.get_vocab()
+        if text in vocab:
+            return vocab[text]
+        token_id = self.tokenizer.convert_tokens_to_ids(text)
+        if token_id is None:
+            return None
+        unk_id = self.tokenizer.unk_token_id
+        if unk_id is not None and token_id == unk_id:
+            return None
+        return token_id
+
+    def get_bos_token_id(self):
+        return self.bos_token_id
+
+    def _encode_one(self, text, prepend=None, append=None, num_threads=None):
+        # num_threads kept for interface compatibility.
+        assert isinstance(text, str)
+        ids = self.tokenizer.encode(text, add_special_tokens=False)
+        if prepend is not None:
+            prepend_id = prepend if isinstance(prepend, int) else self.encode_special(prepend)
+            ids = [prepend_id] + ids
+        if append is not None:
+            append_id = append if isinstance(append, int) else self.encode_special(append)
+            ids = ids + [append_id]
+        return ids
+
+    def encode(self, text, *args, **kwargs):
+        if isinstance(text, str):
+            return self._encode_one(text, *args, **kwargs)
+        if isinstance(text, list):
+            return [self._encode_one(t, *args, **kwargs) for t in text]
+        raise ValueError(f"Invalid input type: {type(text)}")
+
+    def __call__(self, *args, **kwargs):
+        return self.encode(*args, **kwargs)
+
+    def decode(self, ids):
+        return self.tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+
+    def save(self, tokenizer_dir):
+        os.makedirs(tokenizer_dir, exist_ok=True)
+        self.tokenizer.save_pretrained(tokenizer_dir)
+
+    # Phase A scope: chat-template rendering for HF tokenizer is not wired yet.
+    def render_conversation(self, conversation, max_tokens=2048):
+        raise NotImplementedError("TransformersTokenizer.render_conversation is not implemented in Phase A")
+
+    def render_for_completion(self, conversation):
+        raise NotImplementedError("TransformersTokenizer.render_for_completion is not implemented in Phase A")
+
+# -----------------------------------------------------------------------------
 # Tokenizer based on rustbpe + tiktoken combo
 import pickle
 import rustbpe

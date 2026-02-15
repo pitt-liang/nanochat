@@ -11,6 +11,7 @@ import torch
 from nanochat.common import get_base_dir
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
+from nanochat.model_factory import build_model_from_spec, build_tokenizer_from_spec
 from nanochat.common import setup_default_logging
 
 # Set up logging
@@ -92,6 +93,30 @@ def build_model(checkpoint_dir, step, device, phase):
         }
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
+    model_spec = meta_data.get("model_spec")
+    tokenizer_spec = meta_data.get("tokenizer_spec")
+
+    # New path: explicit model/tokenizer specs.
+    if model_spec is not None:
+        log0(f"Building model from model_spec: {model_spec}")
+        model = build_model_from_spec(model_spec, device=device, phase=phase)
+        if model_data:
+            # Keep strict=False to tolerate spec evolution across phases.
+            missing, unexpected = model.load_state_dict(model_data, strict=False)
+            if missing:
+                log0(f"Missing keys while loading model state: {missing[:8]}{' ...' if len(missing) > 8 else ''}")
+            if unexpected:
+                log0(f"Unexpected keys while loading model state: {unexpected[:8]}{' ...' if len(unexpected) > 8 else ''}")
+
+        tokenizer = build_tokenizer_from_spec(tokenizer_spec)
+        expected_vocab_size = getattr(model.config, "vocab_size", None)
+        if expected_vocab_size is not None:
+            assert tokenizer.get_vocab_size() == expected_vocab_size, (
+                f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model vocab size {expected_vocab_size}"
+            )
+        return model, tokenizer, meta_data
+
+    # Legacy path: GPT-only checkpoints.
     model_config_kwargs = meta_data["model_config"]
     _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")
