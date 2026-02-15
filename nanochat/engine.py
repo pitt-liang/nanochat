@@ -185,6 +185,39 @@ class Engine:
     def _uses_full_recompute_generation(self):
         return getattr(self.model, "engine_mode", "kv_cache") == "full_recompute"
 
+    @staticmethod
+    def _kv_cache_shape_from_config(config):
+        num_layers = getattr(config, "n_layer", None)
+        if num_layers is None:
+            num_layers = getattr(config, "num_hidden_layers", None)
+
+        num_heads = getattr(config, "n_kv_head", None)
+        if num_heads is None:
+            num_heads = getattr(config, "num_key_value_heads", None)
+
+        head_dim = None
+        if hasattr(config, "n_embd") and hasattr(config, "n_head"):
+            head_dim = config.n_embd // config.n_head
+        if head_dim is None:
+            head_dim = getattr(config, "head_dim", None)
+        if head_dim is None and hasattr(config, "hidden_size") and hasattr(config, "num_attention_heads"):
+            head_dim = config.hidden_size // config.num_attention_heads
+
+        if num_layers is None or num_heads is None or head_dim is None:
+            raise ValueError("Model config does not expose KV-cache shape fields")
+        return {"num_layers": num_layers, "num_heads": num_heads, "head_dim": head_dim}
+
+    @staticmethod
+    def _max_sequence_len_from_model(model):
+        config = model.config
+        if hasattr(config, "sequence_len"):
+            return config.sequence_len
+        if hasattr(config, "max_position_embeddings"):
+            return config.max_position_embeddings
+        if hasattr(model, "max_seq_len"):
+            return model.max_seq_len
+        return 2048
+
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
         if self._uses_full_recompute_generation():
@@ -218,7 +251,7 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        kv_model_kwargs = self._kv_cache_shape_from_config(m)
         kv_cache_prefill = KVCache(
             batch_size=1,
             seq_len=len(tokens),
@@ -231,7 +264,11 @@ class Engine:
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for each sample/row
-        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
+        kv_length_hint = (
+            len(tokens) + max_tokens
+            if max_tokens is not None
+            else self._max_sequence_len_from_model(self.model)
+        )
         kv_cache_decode = KVCache(
             batch_size=num_samples,
             seq_len=kv_length_hint,

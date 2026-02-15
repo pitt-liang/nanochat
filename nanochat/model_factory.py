@@ -8,6 +8,7 @@ import torch
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.model_adapter import HFBackedCausalLMAdapter, Qwen3HFAdapter
+from nanochat.qwen3 import Qwen3, Qwen3Config
 from nanochat.tokenizer import TransformersTokenizer, get_tokenizer
 
 
@@ -67,6 +68,20 @@ def build_model_from_spec(model_spec: dict, device, phase: str = "eval"):
         model_config = GPTConfig(**config_kwargs)
         with torch.device("meta"):
             model = GPT(model_config)
+        model.to_empty(device=device)
+        model.init_weights()
+    elif family == "qwen3_nanochat":
+        config_kwargs = model_spec.get("config")
+        if not isinstance(config_kwargs, dict):
+            raise ValueError("qwen3_nanochat requires model_spec.config")
+        init_from = model_spec.get("init_from", "scratch")
+        if init_from != "scratch":
+            raise NotImplementedError(
+                "qwen3_nanochat currently supports only init_from='scratch' in Phase C1"
+            )
+        model_config = Qwen3Config(**config_kwargs)
+        with torch.device("meta"):
+            model = Qwen3(model_config)
         model.to_empty(device=device)
         model.init_weights()
     else:

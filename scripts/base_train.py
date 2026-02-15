@@ -185,16 +185,40 @@ if args.model_family == "gpt":
     model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
     model.init_weights() # 3) All tensors get initialized
 else:
+    # Phase C1: native nanochat Qwen3-0.6B architecture (scratch init only).
+    qwen3_config_kwargs = {
+        "vocab_size": max(151936, vocab_size),
+        "hidden_size": 1024,
+        "intermediate_size": 3072,
+        "num_hidden_layers": 28,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "max_position_embeddings": max(40960, args.max_seq_len),
+        "initializer_range": 0.02,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1_000_000.0,
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "use_sliding_window": False,
+        "sliding_window": None,
+        "max_window_layers": 28,
+        "tie_word_embeddings": True,
+        "bos_token_id": tokenizer.get_bos_token_id(),
+        "eos_token_id": tokenizer.encode_special("<|im_end|>") if isinstance(tokenizer, TransformersTokenizer) else None,
+        "pad_token_id": tokenizer.encode_special("<|endoftext|>") if isinstance(tokenizer, TransformersTokenizer) else None,
+    }
     model_spec = {
-        "family": "qwen3_hf",
+        "family": "qwen3_nanochat",
         "model_id": args.model_id,
-        "init_from": "pretrained",
-        "torch_dtype": "bfloat16" if device.type == "cuda" else "float32",
-        "config_overrides": {},
+        "init_from": "scratch",
+        "dtype": "bfloat16" if device.type == "cuda" else "float32",
+        "config": qwen3_config_kwargs,
     }
     model = build_model_from_spec(model_spec, device=device, phase="train")
     model_config = model.config
-    model_config_kwargs = model.config.to_dict() if hasattr(model.config, "to_dict") else dict(model.config.__dict__)
+    model_config_kwargs = model_spec["config"]
     print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
     model_vocab_size = getattr(model.config, "vocab_size", None)
     if model_vocab_size is not None:
