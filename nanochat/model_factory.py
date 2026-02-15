@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import torch
 
+from nanochat.gpt import GPT, GPTConfig
 from nanochat.model_adapter import HFBackedCausalLMAdapter, Qwen3HFAdapter
 from nanochat.tokenizer import TransformersTokenizer, get_tokenizer
 
@@ -42,6 +43,15 @@ def build_model_from_spec(model_spec: dict, device, phase: str = "eval"):
         if not model_id:
             raise ValueError("hf_causal_lm requires model_spec.model_id")
         model = HFBackedCausalLMAdapter.from_pretrained(model_id=model_id, **model_kwargs)
+    elif family == "gpt_nanochat":
+        config_kwargs = model_spec.get("config")
+        if not isinstance(config_kwargs, dict):
+            raise ValueError("gpt_nanochat requires model_spec.config")
+        model_config = GPTConfig(**config_kwargs)
+        with torch.device("meta"):
+            model = GPT(model_config)
+        model.to_empty(device=device)
+        model.init_weights()
     else:
         raise ValueError(f"Unsupported model family in model_spec: {family!r}")
 

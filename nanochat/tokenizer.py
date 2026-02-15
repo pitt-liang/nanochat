@@ -257,8 +257,14 @@ class TransformersTokenizer:
 # -----------------------------------------------------------------------------
 # Tokenizer based on rustbpe + tiktoken combo
 import pickle
-import rustbpe
-import tiktoken
+try:
+    import rustbpe
+except ImportError: # pragma: no cover - optional dependency in HF-only workflows
+    rustbpe = None
+try:
+    import tiktoken
+except ImportError: # pragma: no cover - optional dependency in HF-only workflows
+    tiktoken = None
 
 class RustBPETokenizer:
     """Light wrapper around tiktoken (for efficient inference) but train with rustbpe"""
@@ -269,6 +275,8 @@ class RustBPETokenizer:
 
     @classmethod
     def train_from_iterator(cls, text_iterator, vocab_size):
+        if rustbpe is None or tiktoken is None:
+            raise ImportError("RustBPETokenizer requires both rustbpe and tiktoken to train.")
         # 1) train using rustbpe
         tokenizer = rustbpe.Tokenizer()
         # the special tokens are inserted later in __init__, we don't train them here
@@ -291,6 +299,8 @@ class RustBPETokenizer:
 
     @classmethod
     def from_directory(cls, tokenizer_dir):
+        if tiktoken is None:
+            raise ImportError("RustBPETokenizer.from_directory requires tiktoken.")
         pickle_path = os.path.join(tokenizer_dir, "tokenizer.pkl")
         with open(pickle_path, "rb") as f:
             enc = pickle.load(f)
@@ -298,6 +308,8 @@ class RustBPETokenizer:
 
     @classmethod
     def from_pretrained(cls, tiktoken_name):
+        if tiktoken is None:
+            raise ImportError("RustBPETokenizer.from_pretrained requires tiktoken.")
         # https://github.com/openai/tiktoken/blob/eedc8563/tiktoken_ext/openai_public.py
         enc = tiktoken.get_encoding(tiktoken_name)
         # tiktoken calls the special document delimiter token "<|endoftext|>"

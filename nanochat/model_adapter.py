@@ -38,6 +38,88 @@ class HFBackedCausalLMAdapter(nn.Module):
     def get_device(self) -> torch.device:
         return next(self.model.parameters()).device
 
+    def _split_optimizer_params(self):
+        named_params = [(n, p) for n, p in self.named_parameters() if p.requires_grad]
+        embed_params = [p for n, p in named_params if "embed_tokens" in n]
+        lm_head_params = [p for n, p in named_params if "lm_head" in n]
+        embed_ids = {id(p) for p in embed_params}
+        lm_head_ids = {id(p) for p in lm_head_params}
+        rest_params = [p for _, p in named_params if id(p) not in embed_ids and id(p) not in lm_head_ids]
+        return embed_params, lm_head_params, rest_params
+
+    def setup_optimizer(
+        self,
+        unembedding_lr=0.004,
+        embedding_lr=0.2,
+        matrix_lr=0.02,
+        weight_decay=0.0,
+        adam_betas=(0.9, 0.95),
+        scalar_lr=0.5,
+    ):
+        # scalar_lr is accepted for interface compatibility.
+        del scalar_lr
+        embed_params, lm_head_params, rest_params = self._split_optimizer_params()
+        param_groups = []
+        if lm_head_params:
+            param_groups.append(
+                dict(
+                    kind="adamw",
+                    params=lm_head_params,
+                    lr=unembedding_lr,
+                    betas=adam_betas,
+                    eps=1e-8,
+                    weight_decay=0.0,
+                )
+            )
+        if embed_params:
+            param_groups.append(
+                dict(
+                    kind="adamw",
+                    params=embed_params,
+                    lr=embedding_lr,
+                    betas=adam_betas,
+                    eps=1e-8,
+                    weight_decay=0.0,
+                )
+            )
+        if rest_params:
+            param_groups.append(
+                dict(
+                    kind="adamw",
+                    params=rest_params,
+                    lr=matrix_lr,
+                    betas=adam_betas,
+                    eps=1e-8,
+                    weight_decay=weight_decay,
+                )
+            )
+        optimizer = torch.optim.AdamW(param_groups)
+        for group in optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+        return optimizer
+
+    def num_scaling_params(self):
+        total = sum(p.numel() for p in self.parameters())
+        wte = 0
+        if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
+            wte = self.model.model.embed_tokens.weight.numel()
+        lm_head = 0
+        if hasattr(self.model, "lm_head"):
+            lm_head = self.model.lm_head.weight.numel()
+        transformer_matrices = max(total - wte - lm_head, 0)
+        return {
+            "wte": wte,
+            "value_embeds": 0,
+            "lm_head": lm_head,
+            "transformer_matrices": transformer_matrices,
+            "scalars": 0,
+            "total": total,
+        }
+
+    def estimate_flops(self):
+        # Generic training FLOPs/token approximation.
+        return 6 * sum(p.numel() for p in self.parameters())
+
     def forward(self, input_ids, targets=None, kv_cache=None, loss_reduction="mean"):
         # kv_cache is accepted for interface compatibility; full-recompute path ignores it for now.
         outputs = self.model(input_ids=input_ids, use_cache=False)

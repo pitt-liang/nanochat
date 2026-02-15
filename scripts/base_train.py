@@ -21,13 +21,17 @@ import argparse
 from dataclasses import asdict
 from contextlib import nullcontext, contextmanager
 
-import wandb
 import torch
+try:
+    import wandb
+except ImportError: # pragma: no cover - optional logging dependency
+    wandb = None
 
 from nanochat.gpt import GPT, GPTConfig
+from nanochat.model_factory import build_model_from_spec, build_tokenizer_from_spec
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
-from nanochat.tokenizer import get_tokenizer, get_token_bytes
+from nanochat.tokenizer import TransformersTokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
@@ -45,6 +49,10 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
+# Model family
+parser.add_argument("--model-family", type=str, default="gpt", choices=["gpt", "qwen3"], help="model family to train")
+parser.add_argument("--model-id", type=str, default="Qwen/Qwen3-0.6B", help="HF model id used for qwen3 mode")
+parser.add_argument("--tokenizer-id", type=str, default="", help="HF tokenizer id used for qwen3 mode (empty => model-id)")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
@@ -97,7 +105,9 @@ else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 
 # wandb logging init
-use_dummy_wandb = args.run == "dummy" or not master_process
+use_dummy_wandb = args.run == "dummy" or not master_process or wandb is None
+if master_process and args.run != "dummy" and wandb is None:
+    print0("wandb is not installed; falling back to DummyWandb.")
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
 # Flash Attention status
@@ -114,8 +124,32 @@ else:
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
-tokenizer = get_tokenizer()
-token_bytes = get_token_bytes(device=device)
+def get_hf_token_bytes(tokenizer, device="cpu"):
+    vocab_size = tokenizer.get_vocab_size()
+    token_bytes = torch.zeros(vocab_size, dtype=torch.int64, device=device)
+    special_ids = {
+        tokenizer.encode_special(token_str)
+        for token_str in tokenizer.get_special_tokens()
+    }
+    special_ids.discard(None)
+    for token_id in range(vocab_size):
+        if token_id in special_ids:
+            token_bytes[token_id] = 0
+        else:
+            token_str = tokenizer.decode([token_id])
+            token_bytes[token_id] = len(token_str.encode("utf-8"))
+    return token_bytes
+
+if args.model_family == "qwen3":
+    tokenizer_spec = {
+        "family": "hf_auto",
+        "tokenizer_id": args.tokenizer_id if args.tokenizer_id else args.model_id,
+    }
+else:
+    tokenizer_spec = {"family": "nanochat_rustbpe"}
+
+tokenizer = build_tokenizer_from_spec(tokenizer_spec)
+token_bytes = get_hf_token_bytes(tokenizer, device=device) if isinstance(tokenizer, TransformersTokenizer) else get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
@@ -138,23 +172,58 @@ def build_model_meta(depth):
         model_meta = GPT(config)
     return model_meta
 
-# Build the model, move to device, init the weights
-model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
-model_config = model.config
-model_config_kwargs = asdict(model_config)
-print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
-model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
-model.init_weights() # 3) All tensors get initialized
+if args.model_family == "gpt":
+    # Build the model, move to device, init the weights
+    model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
+    model_config = model.config
+    model_config_kwargs = asdict(model_config)
+    model_spec = {
+        "family": "gpt_nanochat",
+        "config": model_config_kwargs,
+    }
+    print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
+    model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
+    model.init_weights() # 3) All tensors get initialized
+else:
+    model_spec = {
+        "family": "qwen3_hf",
+        "model_id": args.model_id,
+        "init_from": "pretrained",
+        "torch_dtype": "bfloat16" if device.type == "cuda" else "float32",
+        "config_overrides": {},
+    }
+    model = build_model_from_spec(model_spec, device=device, phase="train")
+    model_config = model.config
+    model_config_kwargs = model.config.to_dict() if hasattr(model.config, "to_dict") else dict(model.config.__dict__)
+    print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
+default_model_tag = f"d{args.depth}" if args.model_family == "gpt" else args.model_id.split("/")[-1].lower().replace(".", "-")
+output_dirname = args.model_tag if args.model_tag else default_model_tag
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
-    model.load_state_dict(model_data, strict=True, assign=True)
+    resume_model_spec = meta_data.get("model_spec")
+    if args.model_family == "qwen3" and resume_model_spec is None:
+        raise ValueError("Qwen3 resume requires checkpoint metadata with model_spec (new schema).")
+    if resume_model_spec is not None and resume_model_spec.get("family") != model_spec.get("family"):
+        raise ValueError(f"Resume checkpoint model family mismatch: {resume_model_spec.get('family')} vs {model_spec.get('family')}")
+    if args.model_family == "qwen3":
+        resume_model_id = resume_model_spec.get("model_id")
+        if resume_model_id is not None and resume_model_id != model_spec.get("model_id"):
+            raise ValueError(f"Resume checkpoint model_id mismatch: {resume_model_id} vs {model_spec.get('model_id')}")
+        resume_tokenizer_spec = meta_data.get("tokenizer_spec")
+        if resume_tokenizer_spec is None:
+            raise ValueError("Qwen3 resume requires checkpoint metadata with tokenizer_spec (new schema).")
+        if resume_tokenizer_spec != tokenizer_spec:
+            raise ValueError(f"Resume checkpoint tokenizer_spec mismatch: {resume_tokenizer_spec} vs {tokenizer_spec}")
+    if args.model_family == "gpt":
+        model.load_state_dict(model_data, strict=True, assign=True)
+    else:
+        model.load_state_dict(model_data, strict=True)
     del model_data # free up this memory after the copy
 
 # -----------------------------------------------------------------------------
@@ -236,18 +305,35 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if args.model_family == "qwen3":
+    print0("Qwen3 mode: skipping torch.compile in Phase B for stability.")
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
 
 # Get the parameter counts of our model
-param_counts = model.num_scaling_params()
+if hasattr(model, "num_scaling_params"):
+    param_counts = model.num_scaling_params()
+else:
+    total_params = sum(p.numel() for p in model.parameters())
+    param_counts = {
+        "wte": 0,
+        "value_embeds": 0,
+        "lm_head": 0,
+        "transformer_matrices": total_params,
+        "scalars": 0,
+        "total": total_params,
+    }
 print0(f"Parameter counts:")
 for key, value in param_counts.items():
     print0(f"{key:24s}: {value:,}")
 num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops()
+if hasattr(model, "estimate_flops"):
+    num_flops_per_token = model.estimate_flops()
+else:
+    num_flops_per_token = 6 * num_params
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 # 1) Use scaling laws to determine the optimal training horizon in tokens
@@ -255,16 +341,23 @@ print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 # We've already initialized the model so we have Params. Optimal Tokens is now simply target-param-data-ratio * Params
 def get_scaling_params(m):
     # As for which params to use exactly, transformer matrices + lm_head gives cleanest scaling laws (see dev/LOG.md Jan 27, 2026)
-    params_counts = m.num_scaling_params()
-    scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
-    return scaling_params
+    if hasattr(m, "num_scaling_params"):
+        params_counts = m.num_scaling_params()
+        scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
+        return scaling_params
+    return sum(p.numel() for p in m.parameters())
 num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
-# Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-d12_ref = build_model_meta(12) # creates the model on meta device
-D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
-B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
+if args.model_family == "gpt":
+    # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
+    d12_ref = build_model_meta(12) # creates the model on meta device
+    D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
+    B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
+else:
+    # Phase B: keep a conservative reference for non-GPT families.
+    D_REF = max(target_tokens, 1)
+    B_REF = 2**19
 
 # 2) Now that we have the token horizon, we can calculate the optimal batch size
 # We follow the Power Lines paper (Bopt ∝ D^0.383), ref: https://arxiv.org/abs/2505.13738
@@ -315,7 +408,7 @@ if resuming:
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
-dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
+dataloader_resume_state_dict = None if not resuming else meta_data.get("dataloader_state_dict")
 train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
@@ -447,8 +540,9 @@ while True:
             "If 5*x + 3 = 13, then x is",
         ]
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+        bos_token_id = tokenizer.get_bos_token_id()
         for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
+            tokens = tokenizer(prompt, prepend=bos_token_id)
             with disable_fp8(orig_model), autocast_ctx:
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
@@ -464,7 +558,13 @@ while True:
             { # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
+                "model_spec": model_spec,
+                "tokenizer_spec": tokenizer_spec,
                 "model_config": model_config_kwargs,
+                "train_spec": {
+                    "model_family": args.model_family,
+                    "model_id": args.model_id if args.model_family == "qwen3" else None,
+                },
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
@@ -500,7 +600,7 @@ while True:
     muon_weight_decay = get_weight_decay(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
+        if group.get('kind') == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
