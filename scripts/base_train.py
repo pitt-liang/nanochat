@@ -196,6 +196,15 @@ else:
     model_config = model.config
     model_config_kwargs = model.config.to_dict() if hasattr(model.config, "to_dict") else dict(model.config.__dict__)
     print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
+    model_vocab_size = getattr(model.config, "vocab_size", None)
+    if model_vocab_size is not None:
+        if vocab_size > model_vocab_size:
+            raise ValueError(f"Tokenizer vocab size {vocab_size} exceeds model vocab size {model_vocab_size}.")
+        if vocab_size != model_vocab_size:
+            print0(
+                f"Tokenizer vocab size ({vocab_size}) is smaller than model vocab size ({model_vocab_size}); "
+                "model tail embeddings will be unused."
+            )
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()

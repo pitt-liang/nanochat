@@ -32,17 +32,34 @@ def build_model_from_spec(model_spec: dict, device, phase: str = "eval"):
     """
     family = model_spec.get("family")
     model_id = model_spec.get("model_id")
-    dtype = _parse_torch_dtype(model_spec.get("torch_dtype"))
+    dtype = _parse_torch_dtype(model_spec.get("dtype", model_spec.get("torch_dtype")))
     model_kwargs = {}
     if dtype is not None:
-        model_kwargs["torch_dtype"] = dtype
+        model_kwargs["dtype"] = dtype
 
     if family == "qwen3_hf":
-        model = Qwen3HFAdapter.from_pretrained(model_id=model_id or "Qwen/Qwen3-0.6B", **model_kwargs)
+        try:
+            model = Qwen3HFAdapter.from_pretrained(model_id=model_id or "Qwen/Qwen3-0.6B", **model_kwargs)
+        except TypeError as exc:
+            # Backward compatibility with older transformers that only accept torch_dtype.
+            if "dtype" in model_kwargs and "unexpected keyword argument 'dtype'" in str(exc):
+                legacy_kwargs = dict(model_kwargs)
+                legacy_kwargs["torch_dtype"] = legacy_kwargs.pop("dtype")
+                model = Qwen3HFAdapter.from_pretrained(model_id=model_id or "Qwen/Qwen3-0.6B", **legacy_kwargs)
+            else:
+                raise
     elif family == "hf_causal_lm":
         if not model_id:
             raise ValueError("hf_causal_lm requires model_spec.model_id")
-        model = HFBackedCausalLMAdapter.from_pretrained(model_id=model_id, **model_kwargs)
+        try:
+            model = HFBackedCausalLMAdapter.from_pretrained(model_id=model_id, **model_kwargs)
+        except TypeError as exc:
+            if "dtype" in model_kwargs and "unexpected keyword argument 'dtype'" in str(exc):
+                legacy_kwargs = dict(model_kwargs)
+                legacy_kwargs["torch_dtype"] = legacy_kwargs.pop("dtype")
+                model = HFBackedCausalLMAdapter.from_pretrained(model_id=model_id, **legacy_kwargs)
+            else:
+                raise
     elif family == "gpt_nanochat":
         config_kwargs = model_spec.get("config")
         if not isinstance(config_kwargs, dict):

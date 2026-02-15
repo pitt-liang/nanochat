@@ -111,9 +111,15 @@ def build_model(checkpoint_dir, step, device, phase):
         tokenizer = build_tokenizer_from_spec(tokenizer_spec)
         expected_vocab_size = getattr(model.config, "vocab_size", None)
         if expected_vocab_size is not None:
-            assert tokenizer.get_vocab_size() == expected_vocab_size, (
-                f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model vocab size {expected_vocab_size}"
+            tokenizer_vocab_size = tokenizer.get_vocab_size()
+            assert tokenizer_vocab_size <= expected_vocab_size, (
+                f"Tokenizer vocab size {tokenizer_vocab_size} exceeds model vocab size {expected_vocab_size}"
             )
+            if tokenizer_vocab_size != expected_vocab_size:
+                log0(
+                    f"Tokenizer vocab size {tokenizer_vocab_size} is smaller than model vocab size {expected_vocab_size}; "
+                    "assuming model has unused tail embeddings."
+                )
         return model, tokenizer, meta_data
 
     # Legacy path: GPT-only checkpoints.
